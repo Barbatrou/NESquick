@@ -404,8 +404,23 @@ impl Cpu
             InstructionResult::OAMDMA => if self.cycles % 2 == 1 {514} else {513},
         }
     }
-}
 
+    fn trace(&self)
+    {
+        println!(
+            "{:04X}  {:2X} {:2X} {:2X}  {:3}                             A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}             CYC:{}",
+            self.registers.pc,
+            self.load(self.registers.pc), self.load(self.registers.pc + 1), self.load(self.registers.pc + 2),
+            self.get_instruction_name(self.load(self.registers.pc)),
+            self.registers.a,
+            self.registers.x,
+            self.registers.y,
+            self.registers.p.get_byte(),
+            self.registers.stack_pointer,
+            self.cycles,
+        );
+    }
+}
 
 impl Clocked for Cpu
 {
@@ -413,19 +428,7 @@ impl Clocked for Cpu
     {
         match self.wait_cycles {
             0 => {
-                // trace
-                println!(
-                    "{:04X}  {:2X} {:2X} {:2X}  {:3}                    A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X} CYC:{}",
-                    self.registers.pc,
-                    self.load(self.registers.pc), self.load(self.registers.pc + 1), self.load(self.registers.pc + 2),
-                    self.get_instruction_name(self.load(self.registers.pc)),
-                    self.registers.a,
-                    self.registers.x,
-                    self.registers.y,
-                    self.registers.p.get_byte(),
-                    self.registers.stack_pointer,
-                    self.cycles,
-                );
+                self.trace();
                 let opcode = self.fetch();
                 self.wait_cycles = self.execute_instruction(opcode);
             },

@@ -1,9 +1,48 @@
 use super::Cpu;
 use super::InstructionResult;
 use super::AddressingMode;
+use std::sync::atomic::Ordering::AcqRel;
+
+enum LoadDestination
+{
+    Accumulator,
+    X,
+    Y,
+}
 
 impl Cpu
 {
+    // Load/store
+    fn load_instruction(&mut self, data: u8, dest: LoadDestination)
+    {
+        self.registers.set_status_zero(data == 0);
+        self.registers.set_status_negative(data & 0x80 == 0x80);
+        match dest {
+            LoadDestination::Accumulator => self.registers.a = data,
+            LoadDestination::X => self.registers.x = data,
+            LoadDestination::Y => self.registers.y = data,
+        }
+    }
+
+    pub fn lda(&mut self, addressing_mode: &dyn AddressingMode) -> InstructionResult
+    {
+        self.load_instruction(addressing_mode.read(&self), LoadDestination::Accumulator);
+        InstructionResult::Ok
+    }
+
+    pub fn ldx(&mut self, addressing_mode: &dyn AddressingMode) -> InstructionResult
+    {
+        self.load_instruction(addressing_mode.read(&self), LoadDestination::X);
+        InstructionResult::Ok
+    }
+
+    pub fn ldy(&mut self, addressing_mode: &dyn AddressingMode) -> InstructionResult
+    {
+        self.load_instruction(addressing_mode.read(&self), LoadDestination::Y);
+        InstructionResult::Ok
+    }
+
+    // Arithmetic
     pub fn adc(&mut self, addressing_mode: &dyn AddressingMode) -> InstructionResult
     {
         let val = addressing_mode.read(&self);
@@ -16,6 +55,7 @@ impl Cpu
         InstructionResult::Ok
     }
 
+    // System functions
     pub fn brk(&self, _addressing_mode: &dyn AddressingMode) -> InstructionResult
     {
         InstructionResult::Ok

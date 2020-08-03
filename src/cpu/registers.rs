@@ -53,7 +53,7 @@ impl Registers
             p: Status {
                 carry: false,
                 zero: false,
-                interrupt_disable: false,
+                interrupt_disable: true,
                 decimal: false,
                 overflow: false,
                 negative: false,

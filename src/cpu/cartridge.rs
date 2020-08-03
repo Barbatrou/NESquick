@@ -28,7 +28,14 @@ impl DummyMapper
 }
 impl Mapper for DummyMapper
 {
-    fn read(&self, _address: u16) -> u8 { 0 }
+    fn read(&self, address: u16) -> u8
+    {
+        match address {
+            0xFFFE => 0x00,
+            0xFFFF => 0x80,
+            _ => 0,
+        }
+    }
     fn write(&mut self, _address: u16, _data: u8) {}
 }
 

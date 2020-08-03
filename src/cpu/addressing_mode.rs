@@ -4,6 +4,7 @@ pub trait AddressingMode
 {
     fn read(&self, cpu: &Cpu) -> u8;
     fn write(&self, cpu: &mut Cpu, data: u8);
+    fn address(&self) -> u16;
     fn page_boundary_crossed(&self) -> bool;
 }
 
@@ -12,6 +13,7 @@ impl AddressingMode for Implicit
 {
     fn read(&self, _cpu: &Cpu) -> u8 { 0 }
     fn write(&self, _cpu: &mut Cpu, _data: u8) { }
+    fn address(&self) -> u16 { 0 }
     fn page_boundary_crossed(&self) -> bool { false }
 }
 
@@ -20,6 +22,7 @@ impl AddressingMode for Accumulator
 {
     fn read(&self, cpu: &Cpu) -> u8 { cpu.registers.a }
     fn write(&self, cpu: &mut Cpu, data: u8) { cpu.registers.a = data }
+    fn address(&self) -> u16 { 0 }
     fn page_boundary_crossed(&self) -> bool { false }
 }
 
@@ -38,6 +41,7 @@ impl AddressingMode for Immediate
 {
     fn read(&self, _cpu: &Cpu) -> u8 { self.value }
     fn write(&self, _cpu: &mut Cpu, _data: u8) { }
+    fn address(&self) -> u16 { 0 }
     fn page_boundary_crossed(&self) -> bool { false }
 }
 
@@ -56,6 +60,7 @@ impl AddressingMode for Relative
 {
     fn read(&self, _cpu: &Cpu) -> u8 { self.offset }
     fn write(&self, _cpu: &mut Cpu, _data: u8) { }
+    fn address(&self) -> u16 { 0 }
     fn page_boundary_crossed(&self) -> bool { false }
 }
 
@@ -119,5 +124,6 @@ impl AddressingMode for MemoryAccess
 {
     fn read(&self, cpu: &Cpu) -> u8 { cpu.load(self.address) }
     fn write(&self, cpu: &mut Cpu, data: u8) { cpu.write(self.address, data); }
+    fn address(&self) -> u16 { self.address }
     fn page_boundary_crossed(&self) -> bool { self.page_boundary_crossed }
 }

@@ -32,6 +32,14 @@ use cartridge::{
 pub use cartridge::load_cartridge;
 use crate::cpu::address_space::CartridgeAddressSpace;
 
+enum Interrupts
+{
+    Break,
+    Reset,
+    IRQ,
+    NMI,
+}
+
 pub enum InstructionResult
 {
     Ok,
@@ -103,6 +111,24 @@ impl Cpu
         }
     }
 
+    pub fn push(&mut self, data: u8)
+    {
+        self.write(0x0100 | self.registers.stack_pointer as u16, data);
+        self.registers.stack_pointer = self.registers.stack_pointer.wrapping_sub(1);
+    }
+
+    pub fn top(&self) -> u8
+    {
+        self.load(0x0100 | self.registers.stack_pointer.wrapping_add(1) as u16)
+    }
+
+    pub fn pop(&mut self) -> u8
+    {
+        let data = self.top();
+        self.registers.stack_pointer = self.registers.stack_pointer.wrapping_add(1);
+        data
+    }
+
     pub fn load(&self, address: u16) -> u8
     {
         let address_space = self.corresponding_address_space(address);
@@ -126,6 +152,24 @@ impl Cpu
         let data = self.load_byte_at_pc();
         self.increment_pc();
         data
+    }
+
+    pub fn interrupt(&mut self, kind: Interrupts)
+    {
+        let (vector, b_flag, side_effect_flags) = match kind {
+            Interrupts::Break => (0xFFFEu16, 0b0011_0000u8, 0b0000_0100u8),
+            Interrupts::Reset => (0xFFFCu16, 0b0000_0000u8, 0b0000_0000u8),
+            Interrupts::IRQ => (0xFFFEu16, 0b0010_0000u8, 0b0000_0100u8),
+            Interrupts::NMI => (0xFFFAu16, 0b0010_0000u8, 0b0000_0100u8),
+        };
+
+        let address = self.registers.pc;
+        self.push((address >> 8) as u8);
+        self.push(address as u8);
+        self.push(self.registers.p.get_byte() | b_flag);
+
+        self.registers.pc = self.load(vector) as u16 | (self.load(vector + 1) as u16) << 8;
+        self.registers.p.set_byte(side_effect_flags);
     }
 
     pub fn set_pc(&mut self, address: u16) { self.registers.pc = address }
@@ -335,67 +379,72 @@ impl Cpu
         let wait_cycles = self.get_wait_cycles(opcode, addressing_mode.page_boundary_crossed());
         let instruction_result = match opcode {
             // Control operations
+            0x00 => self.brk(&*addressing_mode),
+            0x40 => self.rti(&*addressing_mode),
+            0x60 => self.rts(&*addressing_mode),
             //// Stack operation
-            0x00 => self.brk(&*addressing_mode), // BRK
-            0x40 => InstructionResult::Ok, // RTI
-            0x60 => InstructionResult::Ok, // RTS
-            0x08 => InstructionResult::Ok, // PHP
-            0x28 => InstructionResult::Ok, // PLP
-            0x48 => InstructionResult::Ok, // PHA
-            0x68 => InstructionResult::Ok, // PLA
-            0x20 => InstructionResult::Ok, // JSR
+            0x08 => self.php(&*addressing_mode),
+            0x28 => self.plp(&*addressing_mode),
+            0x48 => self.pha(&*addressing_mode),
+            0x68 => self.pla(&*addressing_mode),
             //// Jump operation
-            0x4C | 0x6C => InstructionResult::Ok, // JMP
+            0x4C | 0x6C => self.jmp(&*addressing_mode),
+            0x20 => self.jsr(&*addressing_mode),
             //// Branch operation
-            0x10 => InstructionResult::Ok, // BPL
-            0x30 => InstructionResult::Ok, // BMI
-            0x50 => InstructionResult::Ok, // BVC
-            0x70 => InstructionResult::Ok, // BVS
-            0x90 => InstructionResult::Ok, // BCC
-            0xB0 => InstructionResult::Ok, // BCS
-            0xD0 => InstructionResult::Ok, // BNE
-            0xF0 => InstructionResult::Ok, // BEQ
+            0x10 => self.bpl(&*addressing_mode),
+            0x30 => self.bmi(&*addressing_mode),
+            0x50 => self.bvc(&*addressing_mode),
+            0x70 => self.bvs(&*addressing_mode),
+            0x90 => self.bcc(&*addressing_mode),
+            0xB0 => self.bcs(&*addressing_mode),
+            0xD0 => self.bne(&*addressing_mode),
+            0xF0 => self.beq(&*addressing_mode),
             ////
-            0x88 => InstructionResult::Ok, // DEY
-            0xA8 => InstructionResult::Ok, // TAY
-            0xC8 => InstructionResult::Ok, // INY
-            0xE8 => InstructionResult::Ok, // INX
-            0x18 => InstructionResult::Ok, // CLC
-            0x38 => InstructionResult::Ok, // SEC
-            0x58 => InstructionResult::Ok, // CLI
-            0x78 => InstructionResult::Ok, // SEI
-            0x98 => InstructionResult::Ok, // TYA
-            0xB8 => InstructionResult::Ok, // CLV
-            0xD8 => InstructionResult::Ok, // CLD
-            0xF8 => InstructionResult::Ok, // SED
+            0x18 => self.clc(&*addressing_mode),
+            0x38 => self.sec(&*addressing_mode),
+            0x58 => self.cli(&*addressing_mode),
+            0x78 => self.sei(&*addressing_mode),
+            0x88 => self.dey(&*addressing_mode),
+            0x98 => self.tya(&*addressing_mode),
+            0xA8 => self.tay(&*addressing_mode),
+            0xB8 => self.clv(&*addressing_mode),
+            0xC8 => self.iny(&*addressing_mode),
+            0xCA => self.dex(&*addressing_mode),
+            0xD8 => self.cld(&*addressing_mode),
+            0xE8 => self.inx(&*addressing_mode),
+            0xF8 => self.sed(&*addressing_mode),
             0x80 | 0x04 | 0x44 | 0x64 | 0x0C | 0x14 | 0x34 | 0x54 | 0x74 | 0xD4 | 0xF4 | 0x1C | 0x3C | 0x5C | 0x7C | 0xDC | 0xFC => InstructionResult::NOP,
             0x9C => InstructionResult::NOP, // undocumented instructions
-            x if x & 0xE0 == 0x20 && x & 0x03 == 0x00 => InstructionResult::Ok, // BIT
-            x if x & 0xE0 == 0x80 && x & 0x03 == 0x00 => InstructionResult::Ok, // STY
+            x if x & 0xE0 == 0x20 && x & 0x03 == 0x00 => self.bit(&*addressing_mode),
+            x if x & 0xE0 == 0x80 && x & 0x03 == 0x00 => self.sty(&*addressing_mode),
             x if x & 0xE0 == 0xA0 && x & 0x03 == 0x00 => self.ldy(&*addressing_mode),
-            x if x & 0xE0 == 0xC0 && x & 0x03 == 0x00 => InstructionResult::Ok, // CPY
-            x if x & 0xE0 == 0xE0 && x & 0x03 == 0x00 => InstructionResult::Ok, // CPX
+            x if x & 0xE0 == 0xC0 && x & 0x03 == 0x00 => self.cpy(&*addressing_mode),
+            x if x & 0xE0 == 0xE0 && x & 0x03 == 0x00 => self.cpx(&*addressing_mode),
             // ALU operations
             0x89 => InstructionResult::NOP,
-            x if x & 0xE0 == 0x00 && x & 0x03 == 0x01 => InstructionResult::Ok, // ORA
-            x if x & 0xE0 == 0x20 && x & 0x03 == 0x01 => InstructionResult::Ok, // AND
-            x if x & 0xE0 == 0x40 && x & 0x03 == 0x01 => InstructionResult::Ok, // EOR
+            x if x & 0xE0 == 0x00 && x & 0x03 == 0x01 => self.ora(&*addressing_mode),
+            x if x & 0xE0 == 0x20 && x & 0x03 == 0x01 => self.and(&*addressing_mode),
+            x if x & 0xE0 == 0x40 && x & 0x03 == 0x01 => self.eor(&*addressing_mode),
             x if x & 0xE0 == 0x60 && x & 0x03 == 0x01 => self.adc(&*addressing_mode),
-            x if x & 0xE0 == 0x80 && x & 0x03 == 0x01 => InstructionResult::Ok, // STA
+            x if x & 0xE0 == 0x80 && x & 0x03 == 0x01 => self.sta(&*addressing_mode),
             x if x & 0xE0 == 0xA0 && x & 0x03 == 0x01 => self.lda(&*addressing_mode),
-            x if x & 0xE0 == 0xC0 && x & 0x03 == 0x01 => InstructionResult::Ok, // CMP
-            x if x & 0xE0 == 0xE0 && x & 0x03 == 0x01 => InstructionResult::Ok, // SBC
+            x if x & 0xE0 == 0xC0 && x & 0x03 == 0x01 => self.cmp(&*addressing_mode),
+            x if x & 0xE0 == 0xE0 && x & 0x03 == 0x01 => self.sbc(&*addressing_mode),
             // RMW operations
+            0x8A => self.txa(&*addressing_mode),
+            0xAA => self.tax(&*addressing_mode),
+            0x9A => self.txs(&*addressing_mode),
+            0xBA => self.tsx(&*addressing_mode),
             0x82 | 0xC2 | 0xE2 | 0xEA | 0x1A | 0x3A | 0x5A | 0x7A | 0xDA | 0xFA => InstructionResult::NOP,
             0x02 | 0x22 | 0x42 | 0x62 | 0x12 | 0x31 | 0x52 | 0x72 | 0x92 | 0xB2 | 0xD2 | 0xF2 | 0x9E  => InstructionResult::NOP, // undocumented instructions
-            x if x & 0xE0 == 0x00 && x & 0x03 == 0x02 => InstructionResult::Ok, // ASL
-            x if x & 0xE0 == 0x20 && x & 0x03 == 0x02 => InstructionResult::Ok, // ROL
-            x if x & 0xE0 == 0x40 && x & 0x03 == 0x02 => InstructionResult::Ok, // LSR
-            x if x & 0xE0 == 0x60 && x & 0x03 == 0x02 => InstructionResult::Ok, // ROR
-            x if x & 0xE0 == 0x80 && x & 0x03 == 0x02 => InstructionResult::Ok, // STX
+            x if x & 0xE0 == 0x00 && x & 0x03 == 0x02 => self.asl(&*addressing_mode),
+            x if x & 0xE0 == 0x20 && x & 0x03 == 0x02 => self.rol(&*addressing_mode),
+            x if x & 0xE0 == 0x40 && x & 0x03 == 0x02 => self.lsr(&*addressing_mode),
+            x if x & 0xE0 == 0x60 && x & 0x03 == 0x02 => self.ror(&*addressing_mode),
+            x if x & 0xE0 == 0x80 && x & 0x03 == 0x02 => self.stx(&*addressing_mode),
             x if x & 0xE0 == 0xA0 && x & 0x03 == 0x02 => self.ldx(&*addressing_mode),
-            x if x & 0xE0 == 0xC0 && x & 0x03 == 0x02 => InstructionResult::Ok, // DEC
-            x if x & 0xE0 == 0xE0 && x & 0x03 == 0x02 => InstructionResult::Ok, // INC
+            x if x & 0xE0 == 0xC0 && x & 0x03 == 0x02 => self.dec(&*addressing_mode),
+            x if x & 0xE0 == 0xE0 && x & 0x03 == 0x02 => self.inc(&*addressing_mode),
             _ => InstructionResult::NOP, // undocumented instructions
         };
         wait_cycles + match instruction_result {
@@ -408,14 +457,14 @@ impl Cpu
     fn trace(&self)
     {
         println!(
-            "{:04X}  {:2X} {:2X} {:2X}  {:3}                             A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}             CYC:{}",
+            "{:04X}  {:02X} {:02X} {:02X}  {:3}                             A:{:02X} X:{:02X} Y:{:02X} P:{:02X} SP:{:02X}             CYC:{}",
             self.registers.pc,
             self.load(self.registers.pc), self.load(self.registers.pc + 1), self.load(self.registers.pc + 2),
             self.get_instruction_name(self.load(self.registers.pc)),
             self.registers.a,
             self.registers.x,
             self.registers.y,
-            self.registers.p.get_byte(),
+            self.registers.p.get_byte() | 0b0010_0000,
             self.registers.stack_pointer,
             self.cycles,
         );
@@ -1553,6 +1602,3439 @@ mod tests {
             }
         }
 
+        mod sta
+        {
+            use super::*;
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x85);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0x06);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x95);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x00] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x95);
+
+                assert_eq!(cpu.zero_page_ram[0x00], 0x04);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x1F; // same as 0x07 due to mirroring
+                cpu.internal_ram[0x0504] = 0x00;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x8D);
+
+                assert_eq!(cpu.internal_ram[0x0504], 0x06);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x9D);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x06);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x99);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x06);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_absolute_page_boundaries_crossed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0302] = 0x01;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x9D);
+
+                assert_eq!(cpu.internal_ram[0x0302], 0x06);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0302] = 0x06;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x99);
+
+                assert_eq!(cpu.internal_ram[0x0302], 0x06);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x07] = 0x04;
+                cpu.zero_page_ram[0x08] = 0x06;
+                cpu.internal_ram[0x0404] = 0x01;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x07;
+
+                let wait_cycles = cpu.execute_instruction(0x81);
+
+                assert_eq!(cpu.internal_ram[0x0404], 0x07);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_indirect_page_boundaries_crossed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x07] = 0x04;
+                cpu.zero_page_ram[0x08] = 0x06;
+                cpu.internal_ram[0x0404] = 0x01;
+                cpu.registers.x = 0x08;
+                cpu.registers.a = 0x07;
+
+                let wait_cycles = cpu.execute_instruction(0x81);
+
+                assert_eq!(cpu.internal_ram[0x0404], 0x07);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x06;
+                cpu.internal_ram[0x0407] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x07;
+
+                let wait_cycles = cpu.execute_instruction(0x91);
+
+                assert_eq!(cpu.internal_ram[0x0407], 0x07);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed_page_boundaries_crossed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x06;
+                cpu.internal_ram[0x0502] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x07;
+
+                let wait_cycles = cpu.execute_instruction(0x91);
+
+                assert_eq!(cpu.internal_ram[0x0502], 0x07);
+                assert_eq!(wait_cycles, 6);
+            }
+        }
+
+        mod stx
+        {
+            use super::*;
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x86);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0x06);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x01;
+                cpu.registers.y = 0x01;
+                cpu.registers.x = 0xFF;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x96);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x00] = 0x01;
+                cpu.registers.y = 0x01;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x96);
+
+                assert_eq!(cpu.zero_page_ram[0x00], 0x04);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x1F; // same as 0x07 due to mirroring
+                cpu.internal_ram[0x0504] = 0x01;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x8E);
+
+                assert_eq!(cpu.internal_ram[0x0504], 0x06);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod sty
+        {
+            use super::*;
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.y = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x84);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0x06);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.y = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x94);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x00] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x94);
+
+                assert_eq!(cpu.zero_page_ram[0x00], 0x04);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x1F; // same as 0x07 due to mirroring
+                cpu.internal_ram[0x0504] = 0x00;
+                cpu.registers.y = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x8C);
+
+                assert_eq!(cpu.internal_ram[0x0504], 0x06);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x9D);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x06);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x99);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x06);
+                assert_eq!(wait_cycles, 5);
+            }
+        }
+
+        mod tax
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xAA);
+
+                assert_eq!(cpu.registers.x, 0x04);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0xFF;
+                cpu.registers.a = 0x00;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xAA);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xAA);
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x00;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xAA);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x80;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xAA);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod tay
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xA8);
+
+                assert_eq!(cpu.registers.y, 0x04);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0xFF;
+                cpu.registers.a = 0x00;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xA8);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xA8);
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x00;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xA8);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x80;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xA8);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod txa
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x8A);
+
+                assert_eq!(cpu.registers.a, 0x03);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+                cpu.registers.x = 0x00;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0x8A);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x01;
+                cpu.registers.x = 0x04;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0x8A);
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x00;
+                cpu.registers.x = 0x04;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0x8A);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.x = 0x80;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0x8A);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod tya
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x03;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x98);
+
+                assert_eq!(cpu.registers.y, 0x04);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+                cpu.registers.y = 0x00;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0x98);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x01;
+                cpu.registers.y = 0x04;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0x98);
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x00;
+                cpu.registers.y = 0x04;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0x98);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.y = 0x80;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0x98);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod tsx
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x03;
+                cpu.registers.stack_pointer = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xBA);
+
+                assert_eq!(cpu.registers.x, 0x04);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0xFF;
+                cpu.registers.stack_pointer = 0x00;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xBA);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x01;
+                cpu.registers.stack_pointer = 0x04;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xBA);
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x00;
+                cpu.registers.stack_pointer = 0x04;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xBA);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+                cpu.registers.stack_pointer = 0x80;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xBA);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod txs
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x03;
+                cpu.registers.stack_pointer = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x9A);
+
+                assert_eq!(cpu.registers.stack_pointer, 0x03);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFF;
+                cpu.registers.x = 0x00;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0x01;
+                cpu.registers.x = 0x04;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFF;
+                cpu.registers.x = 0x00;
+                cpu.registers.p.zero = true;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0x01;
+                cpu.registers.x = 0x04;
+                cpu.registers.p.zero = true;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0x00;
+                cpu.registers.x = 0x04;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0x04;
+                cpu.registers.x = 0x80;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0x00;
+                cpu.registers.x = 0x04;
+                cpu.registers.p.negative = true;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0x04;
+                cpu.registers.x = 0x80;
+                cpu.registers.p.negative = true;
+
+                cpu.execute_instruction(0x9A);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod pha
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x48);
+
+                assert_eq!(cpu.stack[0xFD], 0x04);
+                assert_eq!(cpu.registers.stack_pointer, 0xFC);
+                assert_eq!(wait_cycles, 3);
+            }
+        }
+
+        mod php
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b0011_0000);
+                assert_eq!(cpu.registers.stack_pointer, 0xFC);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.zero = true;
+                cpu.registers.p.interrupt_disable = true;
+                cpu.registers.p.decimal = true;
+                cpu.registers.p.overflow = true;
+                cpu.registers.p.negative = true;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b1111_1111);
+                assert_eq!(cpu.registers.stack_pointer, 0xFC);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b0011_0001);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = true;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b0011_0010);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_interrupt_disable_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = true;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b0011_0100);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_decimal_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = true;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b0011_1000);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_overflow_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = true;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b0111_0000);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = true;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x08);
+
+                assert_eq!(cpu.stack[0xFD], 0b1011_0000);
+                assert_eq!(wait_cycles, 3);
+            }
+        }
+
+        mod pla
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x00;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x68);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(cpu.registers.stack_pointer, 0xFD);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod plp
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.p.decimal = false;
+                cpu.registers.p.overflow = false;
+                cpu.registers.p.negative = false;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b1111_1111;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(cpu.registers.p.interrupt_disable, true);
+                assert_eq!(cpu.registers.p.decimal, true);
+                assert_eq!(cpu.registers.p.overflow, true);
+                assert_eq!(cpu.registers.p.negative, true);
+                assert_eq!(cpu.registers.stack_pointer, 0xFD);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.zero = true;
+                cpu.registers.p.interrupt_disable = true;
+                cpu.registers.p.decimal = true;
+                cpu.registers.p.overflow = true;
+                cpu.registers.p.negative = true;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b0011_0000;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(cpu.registers.stack_pointer, 0xFD);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b0011_0001;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b0011_0010;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_interrupt_disable_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b0011_0100;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, true);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_decimal_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b0011_1000;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, true);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_overflow_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b0111_0000;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, true);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFC;
+                cpu.stack[0xFD] = 0b1011_0000;
+
+                let wait_cycles = cpu.execute_instruction(0x28);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, true);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod and
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x25);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x25);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x25);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x25);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x35);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x2D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x2D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x2D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x2D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x3D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x39);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_indirect_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x21);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indirect_indexed_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x31);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x00;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x80;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x29);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+        }
+
+        mod ora
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x05);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x05);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x05);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x05);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x15);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x0D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x0D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x0D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x0D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x1D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x19);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_indirect_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x01);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indirect_indexed_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x11);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x00;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x80;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+        }
+
+        mod eor
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x45);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x45);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x45);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x45);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x03] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x55);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x4D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x4D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x4D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x4D);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 4);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.x = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x5D);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 5);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0303] = 0x0F;
+                cpu.registers.y = 0x04;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x59);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_indirect_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x0F;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x41);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x0F;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indirect_indexed_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0x0F);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0x00);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0xFF);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0304] = 0x0F;
+                cpu.registers.y = 0x05;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x51);
+
+                assert_eq!(cpu.registers.a, 0xF0);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x00;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.p.zero, true);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xF0;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x49);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x80;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x0F;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x09);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+        }
+
+        mod bit
+        {
+            use super::*;
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x01;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x2C);
+
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x01;
+                cpu.registers.a = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x2C);
+
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x2C);
+
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x01;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0x2C);
+
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x81;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+
+            #[test]
+            fn test_overflow_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.overflow, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x41;
+                cpu.registers.a = 0x0F;
+
+                let wait_cycles = cpu.execute_instruction(0x24);
+
+                assert_eq!(cpu.registers.p.overflow, true);
+            }
+        }
+
         mod adc
         {
             use super::*;
@@ -2044,5 +5526,3712 @@ mod tests {
             }
         }
 
+        mod sbc
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x01;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xE9);
+
+                assert_eq!(cpu.registers.a, 0x02);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x01;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xE9);
+
+                assert_eq!(cpu.registers.a, 0x03);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xE5);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(wait_cycles, 3);
+
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xE5);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFD;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF5);
+
+                assert_eq!(cpu.registers.a, 0xFB);
+                assert_eq!(wait_cycles, 4);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0xFD;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF5);
+
+                assert_eq!(cpu.registers.a, 0xFC);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x00] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF5);
+
+                assert_eq!(cpu.registers.a, 0x02);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x00] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF5);
+
+                assert_eq!(cpu.registers.a, 0x03);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x1F; // same as 0x07 due to mirroring
+                cpu.internal_ram[0x0504] = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xED);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x1F; // same as 0x07 due to mirroring
+                cpu.internal_ram[0x0504] = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xED);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xFD);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF9);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xFD);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x01;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF9);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute_page_boundaries_crossed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0302] = 0x01;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xFD);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0302] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF9);
+
+                assert_eq!(cpu.registers.a, 0x04);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0302] = 0x01;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xFD);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0302] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF9);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x07] = 0x04;
+                cpu.zero_page_ram[0x08] = 0x06;
+                cpu.internal_ram[0x0404] = 0x01;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xE1);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x07] = 0x04;
+                cpu.zero_page_ram[0x08] = 0x06;
+                cpu.internal_ram[0x0404] = 0x01;
+                cpu.registers.x = 0x03;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xE1);
+
+                assert_eq!(cpu.registers.a, 0x06);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_indirect_page_boundaries_crossed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x07] = 0x04;
+                cpu.zero_page_ram[0x08] = 0x06;
+                cpu.internal_ram[0x0404] = 0x01;
+                cpu.registers.x = 0x08;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xE1);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x07] = 0x04;
+                cpu.zero_page_ram[0x08] = 0x06;
+                cpu.internal_ram[0x0404] = 0x01;
+                cpu.registers.x = 0x08;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xE1);
+
+                assert_eq!(cpu.registers.a, 0x06);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x06;
+                cpu.internal_ram[0x0407] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF1);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x06;
+                cpu.internal_ram[0x0407] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF1);
+
+                assert_eq!(cpu.registers.a, 0x06);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indirect_indexed_page_boundaries_crossed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x06;
+                cpu.internal_ram[0x0502] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF1);
+
+                assert_eq!(cpu.registers.a, 0x05);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x06;
+                cpu.internal_ram[0x0502] = 0x01;
+                cpu.registers.y = 0x03;
+                cpu.registers.a = 0x07;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF1);
+
+                assert_eq!(cpu.registers.a, 0x06);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.registers.a = 0x01;
+                cpu.registers.p.carry = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.carry, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = true;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.carry, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.carry, true);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.zero = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_overflow_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.registers.a = 0x06;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.overflow = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.overflow, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x80;
+                cpu.registers.a = 0x80;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.overflow = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.overflow, true);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.registers.a = 0x08;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.registers.a = 0x88;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.negative = false;
+
+                cpu.execute_instruction(0xE9);
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod cmp
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xC9);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC9);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC9);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xC5);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC5);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC5);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD5);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xD5);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xD5);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD5);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xD5);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xD5);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xCD);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xCD);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xCD);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xDD);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xDD);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xDD);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD9);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xD9);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xD9);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xDD);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xDD);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xDD);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 5);
+
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.y = 0x06;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD9);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.y = 0x06;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xD9);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.y = 0x06;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xD9);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xC1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x01;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC1);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_indirect_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xC1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x06;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC1);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indirect_indexed()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xD1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.y = 0x01;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xD1);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indirect_indexed_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.y = 0x06;
+                cpu.registers.a = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.y = 0x06;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xD1);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.y = 0x06;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xD1);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_negative_flags()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x70;
+                cpu.registers.a = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0xC9);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.a = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC9);
+
+                assert_eq!(cpu.registers.p.negative, false);
+            }
+        }
+
+        mod cpx
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xE0);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.x = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xE0);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE0);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xE4);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.x = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xE4);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE4);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xEC);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xEC);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xEC);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_flags()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x70;
+                cpu.registers.x = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0xE0);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.x = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xE0);
+
+                assert_eq!(cpu.registers.p.negative, false);
+            }
+        }
+
+        mod cpy
+        {
+            use super::*;
+
+            #[test]
+            fn test_immediate()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.y = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xC0);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.y = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC0);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC0);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.y = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xC4);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.y = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC4);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x05;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC4);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.y = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xCC);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.y = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xCC);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, true);
+                assert_eq!(wait_cycles, 4);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xCC);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_flags()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x70;
+                cpu.registers.y = 0xF0;
+
+                let wait_cycles = cpu.execute_instruction(0xC0);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x05;
+                cpu.registers.y = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xC0);
+
+                assert_eq!(cpu.registers.p.negative, false);
+            }
+        }
+
+        mod inc
+        {
+            use super::*;
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE6);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0x05);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xE6);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0x00);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xF6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x06);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0xFF;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xF6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x00);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xF6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x05);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0xFF;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xF6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x00);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xEE);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x06);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xEE);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x00);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xFE);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x06);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0xFF;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xFE);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x00);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xFE);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x06);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0xFF;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xFE);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x00);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE6);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xE6);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x7E;
+
+                let wait_cycles = cpu.execute_instruction(0xE6);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x7F;
+
+                let wait_cycles = cpu.execute_instruction(0xE6);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod inx
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE8);
+
+                assert_eq!(cpu.registers.x, 0x05);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xE8);
+
+                assert_eq!(cpu.registers.x, 0x00);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE8);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xE8);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xE8);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x7F;
+
+                let wait_cycles = cpu.execute_instruction(0xE8);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod iny
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC8);
+
+                assert_eq!(cpu.registers.y, 0x05);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xC8);
+
+                assert_eq!(cpu.registers.y, 0x00);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC8);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0xC8);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC8);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x7F;
+
+                let wait_cycles = cpu.execute_instruction(0xC8);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod dec
+        {
+            use super::*;
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC6);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0x03);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0xC6);
+
+                assert_eq!(cpu.zero_page_ram[0x04], 0xFF);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x05;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xD6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x04);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x05] = 0x00;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xD6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0xFF);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x03);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x00;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xD6);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0xFF);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x05;
+
+                let wait_cycles = cpu.execute_instruction(0xCE);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x04);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0204] = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0xCE);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0xFF);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x05;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xDE);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x04);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0205] = 0x00;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xDE);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0xFF);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x05;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xDE);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x04);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0xFF;
+                cpu.internal_ram[1] = 0x04;
+                cpu.internal_ram[0x0305] = 0x00;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0xDE);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0xFF);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xC6);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xC6);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x80;
+
+                let wait_cycles = cpu.execute_instruction(0xC6);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0] = 0x04;
+                cpu.zero_page_ram[0x04] = 0x81;
+
+                let wait_cycles = cpu.execute_instruction(0xC6);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod dex
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xCA);
+
+                assert_eq!(cpu.registers.x, 0x03);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0xCA);
+
+                assert_eq!(cpu.registers.x, 0xFF);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0xCA);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0xCA);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x80;
+
+                let wait_cycles = cpu.execute_instruction(0xCA);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.x = 0x81;
+
+                let wait_cycles = cpu.execute_instruction(0xCA);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod dey
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x88);
+
+                assert_eq!(cpu.registers.y, 0x03);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x88);
+
+                assert_eq!(cpu.registers.y, 0xFF);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x88);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x88);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x80;
+
+                let wait_cycles = cpu.execute_instruction(0x88);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.y = 0x81;
+
+                let wait_cycles = cpu.execute_instruction(0x88);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod asl
+        {
+            use super::*;
+
+            #[test]
+            fn test_accumulator()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.a, 0x08);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x05] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x06);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x08);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x16);
+
+                assert_eq!(cpu.zero_page_ram[0x06], 0x08);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x16);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x08);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0204] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x0E);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x08);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0205] = 0x04;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x1E);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x08);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x0FF;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0305] = 0x04;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x1E);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x08);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.p.carry, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.p.carry, true);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x80;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x40;
+
+                let wait_cycles = cpu.execute_instruction(0x0A);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod lsr
+        {
+            use super::*;
+
+            #[test]
+            fn test_accumulator()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.a, 0x02);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x05] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x46);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x02);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x56);
+
+                assert_eq!(cpu.zero_page_ram[0x06], 0x02);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x56);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x02);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0204] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x4E);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x02);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0205] = 0x04;
+                cpu.registers.x = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x5E);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x02);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x0FF;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0305] = 0x04;
+                cpu.registers.x = 0x06;
+
+                let wait_cycles = cpu.execute_instruction(0x5E);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x02);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.carry, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.carry, true);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x01;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.zero, true);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x00;
+
+                let wait_cycles = cpu.execute_instruction(0x4A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+            }
+        }
+
+        mod rol
+        {
+            use super::*;
+
+            #[test]
+            fn test_accumulator()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.a, 0x08);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.a, 0x09);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x26);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x08);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x26);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x09);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x36);
+
+                assert_eq!(cpu.zero_page_ram[0x06], 0x08);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x36);
+
+                assert_eq!(cpu.zero_page_ram[0x06], 0x09);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x36);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x08);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x36);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x09);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0204] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2E);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x08);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0204] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x2E);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x09);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0205] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x3E);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x08);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0205] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x3E);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x09);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x0FF;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0305] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x3E);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x08);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x0FF;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0305] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x3E);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x09);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.carry, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.carry, true);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x80;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x80;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x40;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x2A);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod ror
+        {
+            use super::*;
+
+            #[test]
+            fn test_accumulator()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.a, 0x02);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.a, 0x82);
+                assert_eq!(wait_cycles, 2);
+            }
+
+            #[test]
+            fn test_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x66);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x02);
+                assert_eq!(wait_cycles, 5);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x66);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x82);
+                assert_eq!(wait_cycles, 5);
+            }
+
+            #[test]
+            fn test_indexed_zero_page()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x76);
+
+                assert_eq!(cpu.zero_page_ram[0x06], 0x02);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x05;
+                cpu.zero_page_ram[0x06] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x76);
+
+                assert_eq!(cpu.zero_page_ram[0x06], 0x82);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_zero_page_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x76);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x02);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0xFF;
+                cpu.zero_page_ram[0x05] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x76);
+
+                assert_eq!(cpu.zero_page_ram[0x05], 0x82);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0204] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6E);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x02);
+                assert_eq!(wait_cycles, 6);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0204] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x6E);
+
+                assert_eq!(cpu.internal_ram[0x0204], 0x82);
+                assert_eq!(wait_cycles, 6);
+            }
+
+            #[test]
+            fn test_indexed_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0205] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x7E);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x02);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0205] = 0x04;
+                cpu.registers.x = 0x01;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x7E);
+
+                assert_eq!(cpu.internal_ram[0x0205], 0x82);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_indexed_absolute_crossing_page_boundaries()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x0FF;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0305] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x7E);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x02);
+                assert_eq!(wait_cycles, 7);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x0FF;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.internal_ram[0x0305] = 0x04;
+                cpu.registers.x = 0x06;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x7E);
+
+                assert_eq!(cpu.internal_ram[0x0305], 0x82);
+                assert_eq!(wait_cycles, 7);
+            }
+
+            #[test]
+            fn test_carry_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.carry, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.carry, true);
+            }
+
+            #[test]
+            fn test_zero_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.zero, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x01;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.zero, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x01;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.zero, false);
+            }
+
+            #[test]
+            fn test_negative_flag()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x00;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.negative, false);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0xFF;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.negative, true);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.a = 0x00;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x6A);
+
+                assert_eq!(cpu.registers.p.negative, true);
+            }
+        }
+
+        mod jmp
+        {
+            use super::*;
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x40;
+                cpu.internal_ram[0x01] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x4C);
+
+                assert_eq!(cpu.registers.pc, 0x0440);
+                assert_eq!(wait_cycles, 3);
+            }
+
+            #[test]
+            fn test_indirect()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x50;
+                cpu.internal_ram[0x01] = 0x05;
+                cpu.internal_ram[0x0350] = 0x40;
+                cpu.internal_ram[0x0351] = 0x04;
+
+                let wait_cycles = cpu.execute_instruction(0x6C);
+
+                assert_eq!(cpu.registers.pc, 0x0440);
+                assert_eq!(wait_cycles, 5);
+            }
+        }
+
+        mod jsr
+        {
+            use super::*;
+
+            #[test]
+            fn test_absolute()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x40;
+                cpu.internal_ram[0x01] = 0x04;
+                cpu.registers.stack_pointer = 0xFD;
+                cpu.stack[0xFD] = 0x04;
+                cpu.stack[0xFC] = 0x04;
+                // pc should be 0x0202 here
+
+                let wait_cycles = cpu.execute_instruction(0x20);
+
+                assert_eq!(cpu.registers.pc, 0x0440);
+                assert_eq!(cpu.registers.stack_pointer, 0xFB);
+                assert_eq!(cpu.stack[0xFD], 0x02);
+                assert_eq!(cpu.stack[0xFC], 0x01);
+                assert_eq!(wait_cycles, 6);
+            }
+        }
+
+        mod rts
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFB;
+                cpu.stack[0xFD] = 0x04;
+                cpu.stack[0xFC] = 0x40;
+                // pc should be 0x0202 here
+
+                let wait_cycles = cpu.execute_instruction(0x60);
+
+                assert_eq!(cpu.registers.pc, 0x0441);
+                assert_eq!(cpu.registers.stack_pointer, 0xFD);
+                assert_eq!(wait_cycles, 6);
+            }
+        }
+
+        mod bcc
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x90);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x90);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x90);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x90);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x90);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod bcs
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0xB0);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xB0);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xB0);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xB0);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xB0);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod beq
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.zero = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF0);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.zero = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF0);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.zero = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF0);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.zero = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF0);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.zero = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF0);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod bne
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.zero = true;
+
+                let wait_cycles = cpu.execute_instruction(0xD0);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.zero = false;
+
+                let wait_cycles = cpu.execute_instruction(0xD0);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.zero = false;
+
+                let wait_cycles = cpu.execute_instruction(0xD0);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.zero = false;
+
+                let wait_cycles = cpu.execute_instruction(0xD0);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.zero = false;
+
+                let wait_cycles = cpu.execute_instruction(0xD0);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod bmi
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.negative = false;
+
+                let wait_cycles = cpu.execute_instruction(0x30);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.negative = true;
+
+                let wait_cycles = cpu.execute_instruction(0x30);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.negative = true;
+
+                let wait_cycles = cpu.execute_instruction(0x30);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.negative = true;
+
+                let wait_cycles = cpu.execute_instruction(0x30);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.negative = true;
+
+                let wait_cycles = cpu.execute_instruction(0x30);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod bpl
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.negative = true;
+
+                let wait_cycles = cpu.execute_instruction(0x10);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.negative = false;
+
+                let wait_cycles = cpu.execute_instruction(0x10);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.negative = false;
+
+                let wait_cycles = cpu.execute_instruction(0x10);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.negative = false;
+
+                let wait_cycles = cpu.execute_instruction(0x10);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.negative = false;
+
+                let wait_cycles = cpu.execute_instruction(0x10);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod bvs
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.overflow = false;
+
+                let wait_cycles = cpu.execute_instruction(0x70);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.overflow = true;
+
+                let wait_cycles = cpu.execute_instruction(0x70);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.overflow = true;
+
+                let wait_cycles = cpu.execute_instruction(0x70);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.overflow = true;
+
+                let wait_cycles = cpu.execute_instruction(0x70);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.overflow = true;
+
+                let wait_cycles = cpu.execute_instruction(0x70);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod bvc
+        {
+            use super::*;
+
+            #[test]
+            fn test_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.overflow = true;
+
+                let wait_cycles = cpu.execute_instruction(0x50);
+
+                assert_eq!(cpu.registers.pc, 0x0201);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.internal_ram[0x00] = 0x04;
+                cpu.registers.p.overflow = false;
+
+                let wait_cycles = cpu.execute_instruction(0x50);
+
+                assert_eq!(cpu.registers.pc, 0x0205);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x02FE;
+                cpu.internal_ram[0xFE] = 0x04;
+                cpu.registers.p.overflow = false;
+
+                let wait_cycles = cpu.execute_instruction(0x50);
+
+                assert_eq!(cpu.registers.pc, 0x0303);
+                assert_eq!(wait_cycles, 4);
+            }
+
+            #[test]
+            fn test_negative_relative()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-4 as i8) as u8;
+                cpu.registers.p.overflow = false;
+
+                let wait_cycles = cpu.execute_instruction(0x50);
+
+                assert_eq!(cpu.registers.pc, 0x0200);
+                assert_eq!(wait_cycles, 3);
+
+                cpu.registers.pc = 0x0203;
+                cpu.internal_ram[0x03] = (-5 as i8) as u8;
+                cpu.registers.p.overflow = false;
+
+                let wait_cycles = cpu.execute_instruction(0x50);
+
+                assert_eq!(cpu.registers.pc, 0x01FF);
+                assert_eq!(wait_cycles, 4);
+            }
+        }
+
+        mod clc
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x18);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x18);
+
+                assert_eq!(cpu.registers.p.carry, false);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod cld
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.decimal = false;
+
+                let wait_cycles = cpu.execute_instruction(0xD8);
+
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.decimal = true;
+
+                let wait_cycles = cpu.execute_instruction(0xD8);
+
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod cli
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.interrupt_disable = false;
+
+                let wait_cycles = cpu.execute_instruction(0x58);
+
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.interrupt_disable = true;
+
+                let wait_cycles = cpu.execute_instruction(0x58);
+
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod clv
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.overflow = false;
+
+                let wait_cycles = cpu.execute_instruction(0xB8);
+
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.overflow = true;
+
+                let wait_cycles = cpu.execute_instruction(0xB8);
+
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod sec
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = false;
+
+                let wait_cycles = cpu.execute_instruction(0x38);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x38);
+
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod sed
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.decimal = false;
+
+                let wait_cycles = cpu.execute_instruction(0xF8);
+
+                assert_eq!(cpu.registers.p.decimal, true);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0xF8);
+
+                assert_eq!(cpu.registers.p.decimal, true);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod sei
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.interrupt_disable = false;
+
+                let wait_cycles = cpu.execute_instruction(0x78);
+
+                assert_eq!(cpu.registers.p.interrupt_disable, true);
+                assert_eq!(wait_cycles, 2);
+
+                cpu.registers.pc = 0x0200;
+                cpu.registers.p.carry = true;
+
+                let wait_cycles = cpu.execute_instruction(0x78);
+
+                assert_eq!(cpu.registers.p.interrupt_disable, true);
+                assert_eq!(wait_cycles, 2);
+            }
+        }
+
+        mod brk
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0201;
+                cpu.registers.p.carry = true;
+                cpu.registers.p.interrupt_disable = false;
+                cpu.registers.stack_pointer = 0xFD;
+
+                let wait_cycles = cpu.execute_instruction(0x00);
+
+                // dummy mapper returns address 0x8000 when loading irq/brk vector
+                assert_eq!(cpu.registers.pc, 0x8000);
+                assert_eq!(cpu.registers.stack_pointer, 0xFA);
+                assert_eq!(cpu.stack[0xFD], 0x02);
+                assert_eq!(cpu.stack[0xFC], 0x01);
+                assert_eq!(cpu.stack[0xFB], 0b0011_0001);
+                assert_eq!(cpu.registers.p.interrupt_disable, true);
+                assert_eq!(wait_cycles, 7);
+            }
+        }
+
+        mod rti
+        {
+            use super::*;
+
+            #[test]
+            fn test_implicit()
+            {
+                let mut cpu = Cpu::new_dummy();
+                cpu.registers.pc = 0x0200;
+                cpu.registers.stack_pointer = 0xFA;
+                cpu.stack[0xFD] = 0x04;
+                cpu.stack[0xFC] = 0x40;
+                cpu.stack[0xFB] = 0b0011_0001;
+                cpu.registers.p.carry = false;
+                cpu.registers.p.interrupt_disable = true;
+                cpu.registers.p.negative = true;
+
+                let wait_cycles = cpu.execute_instruction(0x40);
+
+                assert_eq!(cpu.registers.pc, 0x0440);
+                assert_eq!(cpu.registers.p.carry, true);
+                assert_eq!(cpu.registers.p.zero, false);
+                assert_eq!(cpu.registers.p.interrupt_disable, false);
+                assert_eq!(cpu.registers.p.decimal, false);
+                assert_eq!(cpu.registers.p.overflow, false);
+                assert_eq!(cpu.registers.p.negative, false);
+                assert_eq!(cpu.registers.stack_pointer, 0xFD);
+                assert_eq!(wait_cycles, 6);
+            }
+        }
     }
 }
